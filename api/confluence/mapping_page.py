@@ -1,5 +1,6 @@
 """Точечное обновление колонок «Ссылка на тест-кейсы в Allure» и «Маппинг требований и тестов»."""
-from typing import Any, Callable, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 from atlassian import Confluence
@@ -7,6 +8,9 @@ from bs4 import BeautifulSoup
 
 from api.exceptions import ConfluencePageNotFoundException
 from common.helpers.env_helper import get_var_from_env
+
+
+_PAGE_ID_RE = re.compile(r"pageId=(\d+)")
 
 
 class MappingConfluencePage:
@@ -39,8 +43,7 @@ class MappingConfluencePage:
     def build_body(self, mapping_rows: List[Dict[str, Any]]) -> str:
         """
         В существующем теле страницы для каждого --suite_url найти строку
-        по ссылке на документацию КР/ГФС (берём из first_case.doc_links[0].url),
-        в этой строке:
+        по ссылке на документацию КР/ГФС (из case.links[]). В этой строке:
           • записать suite_url в колонку «Ссылка на тест-кейсы в Allure» (4-я);
           • заменить колонку «Маппинг требований и тестов» (последняя) нашей таблицей
             Тэг | Требование из ГФС | Ссылка на тест-кейс.
@@ -54,36 +57,26 @@ class MappingConfluencePage:
 
         problems: List[str] = []
         for suite_url, rows in by_suite.items():
-            doc_urls = self._collect_doc_urls(rows)
-            if not doc_urls:
+            links = self._collect_doc_links(rows)
+            if not links:
                 problems.append(
                     f"{suite_url}: у кейсов нет ссылок на документацию (links[] пустой)"
                 )
                 continue
 
-            target_a = None
-            for doc_url in doc_urls:
-                target_a = self._find_anchor_by_url(doc_url)
-                if target_a is not None:
+            tr = None
+            for link in links:
+                tr = self._find_row_for_link(link.get("url", ""), link.get("name", ""))
+                if tr is not None:
                     break
-            if target_a is None:
-                problems.append(
-                    f"{suite_url}: ни одна из {len(doc_urls)} ссылок на страницу не нашлась: "
-                    + ", ".join(doc_urls)
-                )
-                continue
-            tr = target_a.find_parent("tr")
             if tr is None:
-                problems.append(f"{suite_url}: <a> найден, но не внутри <tr>")
-                continue
-            tds = tr.find_all("td", recursive=False)
-            if len(tds) < self.EXPECTED_COLUMNS:
+                pretty = ", ".join(f"{l.get('name','')}|{l.get('url','')}" for l in links)
                 problems.append(
-                    f"{suite_url}: в найденной строке {len(tds)} td, "
-                    f"ожидали {self.EXPECTED_COLUMNS}"
+                    f"{suite_url}: ни одна из {len(links)} ссылок на доку не нашлась на странице: {pretty}"
                 )
                 continue
 
+            tds = tr.find_all("td", recursive=False)
             self._set_suite_url_cell(tds[self.SUITE_URL_COLUMN_INDEX], suite_url)
             mapping_td = tds[self.MAPPING_COLUMN_INDEX]
             mapping_td.clear()
@@ -97,18 +90,19 @@ class MappingConfluencePage:
 
         return str(self.soup)
 
-    def _collect_doc_urls(self, rows: List[Dict[str, Any]]) -> List[str]:
+    def _collect_doc_links(self, rows: List[Dict[str, Any]]) -> List[Dict[str, str]]:
         """
-        Все непустые URL из links[] всех кейсов группы — без дублей, в исходном порядке.
-        Оставляем только URL'ы из домена Confluence (см. CONFLUENCE_URL),
-        чтобы не словить случайный Allure-cross-ref или Jira-линк.
+        Все непустые links из всех кейсов группы — без дублей по url, в исходном порядке.
+        Оставляем только URL'ы из домена Confluence (см. CONFLUENCE_URL).
+        Возвращает [{"url": ..., "name": ...}, ...].
         """
         confluence_host = urlparse(self.CONFLUENCE_URL).netloc.lower()
         seen: set = set()
-        out: List[str] = []
+        out: List[Dict[str, str]] = []
         for r in rows:
             for link in (r.get("doc_links") or []):
                 url = (link or {}).get("url") or ""
+                name = (link or {}).get("name") or ""
                 if not url:
                     continue
                 host = urlparse(url).netloc.lower()
@@ -117,37 +111,81 @@ class MappingConfluencePage:
                 if url in seen:
                     continue
                 seen.add(url)
-                out.append(url)
+                out.append({"url": url, "name": name})
         return out
 
-    def _find_anchor_by_url(self, target_url: str):
+    def _find_row_for_link(self, doc_url: str, doc_name: str):
         """
-        Ищет <a> с href = target_url, чей родительский <tr> имеет EXPECTED_COLUMNS td.
-        Сравнение умеет в относительные пути и игнорирует фрагмент (#anchor):
-        href='/pages/viewpage.action?pageId=X' матчится с
-        target_url='https://confluence.nexign.com/pages/viewpage.action?pageId=X#section'.
+        Ищет <tr> страницы, содержащий ссылку на ту же доку (любой из способов).
+        Возвращает <tr> с EXPECTED_COLUMNS td или None.
 
-        Любые матчи внутри вложенных таблиц (где tr — 2 td) пропускаем.
+        Стратегии:
+        1. <a href> совпадает с doc_url по path+query (без фрагмента).
+        2. <a href> содержит тот же pageId=X (надёжнее, если есть лишние query-параметры).
+        3. <ri:page ri:content-title=NAME> — Confluence-макрос вставки ссылки на страницу по title.
+        4. <ri:page ri:content-id=PAGE_ID> — то же по id.
+        5. Любой текстовый узел, дословно содержащий doc_name.
         """
-        target_pq = self._path_with_query(target_url)
-        matcher: Callable[[Optional[str]], bool] = lambda href: bool(
-            href and (href == target_url or self._path_with_query(href) == target_pq)
-        )
-        for a in self.soup.find_all("a", href=matcher):
-            tr = a.find_parent("tr")
-            if tr is None:
+        # 1 + 2: <a href>
+        target_pq = self._path_with_query(doc_url)
+        target_pid = self._extract_page_id(doc_url)
+        for a in self.soup.find_all("a", href=True):
+            href = a.get("href", "") or ""
+            ok = (
+                href == doc_url
+                or self._path_with_query(href) == target_pq
+                or (target_pid is not None and self._extract_page_id(href) == target_pid)
+            )
+            if not ok:
                 continue
+            tr = self._outer_tr(a)
+            if tr is not None:
+                return tr
+
+        # 3 + 4: <ri:page>
+        for ri in self.soup.find_all(["ri:page", "ri:Page"]):
+            title = ri.get("ri:content-title") or ri.get("content-title")
+            cid = ri.get("ri:content-id") or ri.get("content-id")
+            if (doc_name and title == doc_name) or (target_pid is not None and str(cid or "") == str(target_pid)):
+                tr = self._outer_tr(ri)
+                if tr is not None:
+                    return tr
+
+        # 5: текст
+        if doc_name:
+            for node in self.soup.find_all(string=lambda s: bool(s and doc_name in s)):
+                tr = self._outer_tr(node)
+                if tr is not None:
+                    return tr
+
+        return None
+
+    def _outer_tr(self, node):
+        """Ближайший родительский <tr>, у которого ≥ EXPECTED_COLUMNS прямых <td>."""
+        cur = node
+        while cur is not None:
+            tr = cur.find_parent("tr")
+            if tr is None:
+                return None
             tds = tr.find_all("td", recursive=False)
             if len(tds) >= self.EXPECTED_COLUMNS:
-                return a
+                return tr
+            cur = tr  # поднимаемся выше, если этот tr — вложенный
         return None
 
     @staticmethod
     def _path_with_query(url: str) -> str:
-        parsed = urlparse(url)
+        parsed = urlparse(url or "")
         if parsed.query:
             return f"{parsed.path}?{parsed.query}"
         return parsed.path
+
+    @staticmethod
+    def _extract_page_id(url: str) -> Optional[str]:
+        if not url:
+            return None
+        m = _PAGE_ID_RE.search(url)
+        return m.group(1) if m else None
 
     def _set_suite_url_cell(self, td, suite_url: str) -> None:
         """Заменяет содержимое td на одну ссылку на suite_url."""
